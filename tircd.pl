@@ -1,6 +1,7 @@
 #!/usr/bin/perl
 # tircd - An ircd proxy to the Twitter API
-# Copyright (c) 2009 Chris Nelson <tircd@crazybrain.org>
+# Copyright (c) 2009 Chris Nelson <tircd@crazybrain.org>, Abram Hindle <abram.hindle@softwareprocess.us>
+# 
 # tircd is free software; you can redistribute it and/or modify it under the terms of either:
 # a) the GNU General Public License as published by the Free Software Foundation
 # b) the "Artistic License"
@@ -15,7 +16,7 @@ use LWP::UserAgent;
 use POE qw(Component::Server::TCP Filter::Stackable Filter::Map Filter::IRCD);
 use Data::Dumper;
 
-my $VERSION = 0.6;
+my $VERSION = 0.7;
 
 #Do some sanity checks on the environment and warn if not what we want
 if ($Net::Twitter::VERSION < 1.23) {
@@ -101,7 +102,11 @@ POE::Component::Server::TCP->new(
     AWAY => \&irc_away,
 
     '#twitter' => \&channel_twitter,
-    
+    #search calls: make a search channel
+    'search'  => \&channel_search,
+    #repeat a search
+    'search_channel_timeline' => \&search_channel_timeline,
+
     server_reply => \&irc_reply,
     user_msg	 => \&irc_user_msg,
 
@@ -412,7 +417,12 @@ sub irc_join {
     if ($kernel->call($_[SESSION],$chan,$chan)) {
       next;
     }
-    
+    # delegate to search channel
+    if ($chan =~ /^#[#?].*$/) {
+      $kernel->call($_[SESSION], 'search', $chan);
+      next;
+    }
+
     $heap->{'channels'}->{$chan} = {};
     
     #otherwise, prep a blank channel  
@@ -882,6 +892,202 @@ sub channel_twitter {
   
   return 1;
 }
+
+
+###########  Twitter Search Channels
+
+# This function takes the heap, a search string to query for
+# and an ID of the last twitter search
+# it returns the an array ref of hashrefs of the results
+# it dies on a bad call when twitter doesn't return something defined
+
+sub twitter_search {
+  my ($heap, $query, $since) = @_;
+  
+  # an example hash:
+  # 'source' => '&lt;a href=&quot;http://www.twhirl.org/&quot;&gt;twhirl&lt;/a&gt;',
+  # 'to_user_id' => 3279334,
+  # 'profile_image_url' => 'http://s3.amazonaws.com/twitter_production/profile_images/76274217/avatar_normal.jpg',
+  # 'from_user_id' => 3963123,
+  # 'iso_language_code' => 'en',
+  # 'to_user' => 'arwagner',
+  # 'created_at' => 'Sun, 22 Feb 2009 06:29:26 +0000',
+  # 'text' => '@arwagner Sorry it took me so long to reply, I just did some research on the #haskell channel, 3RD place behind PHP and Python, impressive!',
+  # 'id' => 1236529990,
+  # 'from_user' => 'kodespark'
+  
+  my $tquery = {
+                query => $query,
+                show_user => 1,                 
+  };
+  if (defined($since)) {
+    $tquery->{since_id} = $since;
+  }
+  
+  my $res = $heap->{'twitter'}->search( $tquery );
+  die "Bad results on search" unless defined $res;
+  my $results = $res->{results};
+  return $results;
+}
+
+# this takes a heap and hstruct (a hashref with at least a search key/value pair)
+# returns (new posts, new users, mutated hstruct)
+# mutates hstruct
+# does a new twitter search
+
+sub hstruct_twitter_search {
+  my ($kernel, $heap, $hstruct) = @_;
+  my $since = $hstruct->{last_id} || undef;
+  my $search = $hstruct->{search};    
+  my $results = twitter_search($heap, $search, $since);
+
+  $kernel->post('logger','log',"Did a twitter search for [ $search ].",$heap->{'username'});
+  my @users = map { $_->{from_user} } @$results;
+  my @posts = map { my $u = $_->{from_user};
+                    my $t = $_->{text};
+                    my $i = $_->{id};
+                    { id => $i, user => $u, msg => $t }} @$results;
+  my @newusers = grep { !exists $hstruct->{users}->{$_} } @users;
+  my %newusers = map { $_ => 1 } @newusers;
+  @newusers = keys %newusers;
+  $hstruct->{users}->{$_} = 1 foreach @newusers;
+  if (@posts) {
+      $hstruct->{last_id} = $posts[0]->{id};
+  }
+  #warn Dumper([\@posts, \@newusers]);
+  return (\@posts, \@newusers, $hstruct);
+}
+
+#convert a channel name into a query
+# spaces are +
+# currently accepts channels like:
+#   ##hashtag        -> #hashtag
+#   #?querystring    -> querystring
+#   #?@you           -> @you
+#   #?"exact+search" -> "exact search"
+# not sure how to search for + or even if twitter allows that
+sub parse_query_from_channel {
+  my ($channel) = @_;
+  my ($search) = ($channel =~ /^#\??(.*)$/);
+  $search =~ s/\+/ /g;
+  return $search;
+}
+
+#this creates a search channel
+sub channel_search {
+  my ($kernel,$heap,$chan) = @_[KERNEL, HEAP, ARG0];
+
+  #add our channel to the list  
+  $heap->{'channels'}->{$chan} = {};
+  my ($search) = parse_query_from_channel($chan);
+  my ($posts, $users, $hstruct) = hstruct_twitter_search($kernel, $heap, { search => $search });
+  my @posts = @$posts;
+  my @users = @$users;
+  $heap->{search_channels}->{$chan} = $hstruct;
+
+  #spoof the channel join
+  $kernel->yield('user_msg','JOIN',$heap->{'username'},$chan);	
+  $kernel->yield('server_reply',332,$chan,"$search");
+  $kernel->yield('server_reply',333,$chan,'tircd!tircd@tircd',time());
+  
+  #the the list of our users for /NAMES
+  my $sawourselves = 0;
+  foreach my $user (@users) {
+    my $ov ='';
+    if ($user  eq $heap->{'username'}) {
+      $ov = '@';
+      $sawourselves = 1;
+    } elsif ($kernel->call($_[SESSION],'getfollower',$user)) {
+      $ov='+';
+    }
+    #keep a copy of who is in this channel
+    $heap->{'channels'}->{$chan}->{'names'}->{$user} = $ov;
+  }
+  #make sure we're in the channel too?
+  unless($sawourselves) {
+    $heap->{'channels'}->{$chan}->{'names'}->{$heap->{'username'}} = '@';
+  }
+  
+
+  #send the /NAMES info
+  my $all_users = '';
+  foreach my $name (keys %{$heap->{'channels'}->{$chan}->{'names'}}) {
+    $all_users .= $heap->{'channels'}->{$chan}->{'names'}->{$name} . $name .' ';
+  }
+  $kernel->yield('server_reply',353,'=',$chan,$all_users);
+  $kernel->yield('server_reply',366,$chan,'End of /NAMES list');
+
+  $kernel->yield('user_msg','TOPIC',$heap->{'username'},$chan,"Query: $search");
+
+
+  output_search_to_channel($kernel, $heap, $chan, $posts, $users);
+
+  #start our twitter even loop, grab the timeline, replies and direct messages
+
+  #todo: update the channel
+  #todo: part the channel
+
+  schedule_search_channel($kernel, $heap, $chan);
+
+  return 1;
+}
+
+#schedules the next call to search channel timeline for the particular channel
+sub schedule_search_channel {
+  my ($kernel, $heap, $channel) = @_;
+  my $wait = $config{'update_searches'}||300;
+  $kernel->post('logger','log',"Scheduling a search channel updated for [ $channel ] in [ $wait ] seconds.",$heap->{'username'});
+  $kernel->delay_add('search_channel_timeline' => $wait, $channel);
+}
+
+#this is a POE event
+#this is what updates a channel if new events occur
+sub search_channel_timeline {
+  my ($kernel, $heap, $channel) = @_[KERNEL, HEAP, ARG0];
+  my $parted = 0;
+  if (!exists $heap->{channels}->{$channel}) {
+    delete $heap->{channels}->{$channel};
+    delete $heap->{search_channels}->{$channel};
+    #done! not scheduled again!
+    return 1;
+  }
+
+  my $hstruct = $heap->{search_channels}->{$channel};
+  my ($posts, $newusers, $hstruct) = hstruct_twitter_search($kernel, $heap, $hstruct);
+  $heap->{search_channels}->{$channel} = $hstruct;
+  output_search_to_channel($kernel, $heap, $channel, $posts, $newusers);
+
+  schedule_search_channel($kernel, $heap, $channel);
+
+  return 1;
+}
+
+# take the results of a search
+# and print them out to the channel
+# takes the kernel, heap, channel, posts arrayref, newusers arrayref
+sub output_search_to_channel {
+  my ($kernel, $heap, $chan, $posts, $newusers) = @_;
+  my @posts = @$posts;
+  my @newusers = @$newusers;
+  foreach my $user (@newusers) {
+    $kernel->yield('user_msg','JOIN',$user, $chan);
+    if ($kernel->call($_[SESSION],'getfollower',$user)) {
+      $heap->{'channels'}->{$chan}->{'names'}->{$user} = '+';
+      $kernel->yield('server_reply','MODE','#twiter','+v',$user);
+    } else {
+      $heap->{'channels'}->{$chan}->{'names'}->{$user} = '';
+    }
+  }
+    
+  foreach my $item (reverse @posts) {
+    if ($item->{'user'} ne $heap->{'username'}) {
+      $kernel->yield('user_msg','PRIVMSG',$item->{'user'},$chan,$item->{'msg'});
+    }
+  }
+}
+
+
+
 
 ########### TWITTER EVENT/ALARM FUNCTIONS
 

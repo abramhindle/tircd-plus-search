@@ -92,11 +92,27 @@ There is currently no way to get a list of users you've currently blocked via th
 
 To unblock a user /unban them.
 
+=item Searching
+
+To use the search.twitter.com gateway simply join a channel with the query in the channel name (spaces are represented by '+' character):
+
+   Channel          -> Query
+   ##hashtag        -> #hashtag
+   #?querystring    -> querystring
+   #?@you           -> @you
+   #?"exact+search" -> "exact search"
+
+That channel will update periodicly based on the 'update_searches' delay parameter specified in the config file. If you speak in a search channel it will update your status but include no reference to the channel itself. No other actions are accepted in a search channel other than part.
+
+   
+
+
 =back
 
 =head1 AUTHOR
 
 Chris Nelson <cnelson@crazybrain.org>
+abram hindle <abram.hindle@softwareprocess.us> (Search Channels)
 
 =head1 LICENSE
 
